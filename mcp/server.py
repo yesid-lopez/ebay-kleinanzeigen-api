@@ -22,6 +22,8 @@ mcp = FastMCP(
         "Use 'get_listing' to fetch full details for a single listing by its ID.\n"
         "Use 'search_listings_detailed' to search AND fetch details in one call."
     ),
+    stateless_http=True,
+    json_response=True,
 )
 
 _client = httpx.AsyncClient(base_url=API_BASE, timeout=60)
@@ -119,4 +121,5 @@ async def search_listings_detailed(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
+    mcp.run(transport=transport, host="0.0.0.0", port=8080)

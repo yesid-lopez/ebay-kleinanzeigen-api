@@ -2,8 +2,6 @@
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that wraps the Kleinanzeigen scraper API. Add it to any Cursor project to let AI agents search and browse Kleinanzeigen listings.
 
-The server is a single Python script with inline dependencies — no install step needed, just `uv`.
-
 ## Tools
 
 | Tool | Description |
@@ -12,15 +10,33 @@ The server is a single Python script with inline dependencies — no install ste
 | `get_listing` | Fetch full details for a single listing by ID |
 | `search_listings_detailed` | Search + fetch details for every result in one call |
 
-## Setup
+## Setup (Remote)
+
+The MCP server runs as an HTTP service on `192.168.2.100:8080`. Any Cursor project can connect to it with zero dependencies.
+
+Add the following to your project's `.cursor/mcp.json` (or `~/.cursor/mcp.json` for global access):
+
+```json
+{
+  "mcpServers": {
+    "kleinanzeigen": {
+      "url": "http://192.168.2.100:8080/mcp"
+    }
+  }
+}
+```
+
+That's it -- no local clone, no installs.
+
+## Setup (Local / Dev)
+
+For local development or if you prefer running the server as a subprocess:
 
 ### Prerequisites
 
 - [uv](https://docs.astral.sh/uv/) installed (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 
 ### Add to Cursor
-
-Add the following to your project's `.cursor/mcp.json` (or the global config at `~/.cursor/mcp.json`):
 
 ```json
 {
@@ -29,7 +45,7 @@ Add the following to your project's `.cursor/mcp.json` (or the global config at 
       "command": "uv",
       "args": ["run", "/absolute/path/to/ebay/mcp/server.py"],
       "env": {
-        "KLEINANZEIGEN_API_URL": "http://192.168.2.100:80"
+        "MCP_TRANSPORT": "stdio"
       }
     }
   }
@@ -38,18 +54,48 @@ Add the following to your project's `.cursor/mcp.json` (or the global config at 
 
 Replace `/absolute/path/to/ebay` with the actual path on your machine.
 
-> The `KLEINANZEIGEN_API_URL` env var is optional — it defaults to `http://192.168.2.100:80`.
-
-### Run manually (for testing)
+### Run manually
 
 ```sh
+# Remote HTTP mode (default)
 uv run mcp/server.py
+
+# Local stdio mode
+MCP_TRANSPORT=stdio uv run mcp/server.py
+
+# Dev inspector
+uv run mcp dev mcp/server.py
 ```
 
-Or use the MCP dev inspector:
+## Deployment
+
+### Docker
 
 ```sh
-uv run mcp dev mcp/server.py
+cd mcp
+docker build -t kleinanzeigen-mcp .
+docker run -d -p 8080:8080 \
+  -e KLEINANZEIGEN_API_URL=http://192.168.2.100:80 \
+  kleinanzeigen-mcp
+```
+
+### Docker Compose (alongside the scraper API)
+
+```yaml
+services:
+  mcp:
+    build: ./mcp
+    ports:
+      - "8080:8080"
+    environment:
+      - KLEINANZEIGEN_API_URL=http://api:8000
+    depends_on:
+      - api
+
+  api:
+    build: .
+    ports:
+      - "80:8000"
 ```
 
 ## Tool Reference
@@ -94,3 +140,4 @@ Search + fetch full details. Slower but returns complete data.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `KLEINANZEIGEN_API_URL` | `http://192.168.2.100:80` | Base URL of the Kleinanzeigen API |
+| `MCP_TRANSPORT` | `streamable-http` | Transport mode: `streamable-http` for remote, `stdio` for local |
