@@ -2,6 +2,8 @@
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that wraps the Kleinanzeigen scraper API. Add it to any Cursor project to let AI agents search and browse Kleinanzeigen listings.
 
+The server is a single Python script with inline dependencies — no install step needed, just `uv`.
+
 ## Tools
 
 | Tool | Description |
@@ -12,19 +14,11 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 
 ## Setup
 
-### 1. Install dependencies
+### Prerequisites
 
-```sh
-cd mcp && npm install
-```
+- [uv](https://docs.astral.sh/uv/) installed (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 
-### 2. Build (only needed if you modify the source)
-
-```sh
-npm run build
-```
-
-### 3. Add to Cursor
+### Add to Cursor
 
 Add the following to your project's `.cursor/mcp.json` (or the global config at `~/.cursor/mcp.json`):
 
@@ -32,8 +26,8 @@ Add the following to your project's `.cursor/mcp.json` (or the global config at 
 {
   "mcpServers": {
     "kleinanzeigen": {
-      "command": "node",
-      "args": ["/absolute/path/to/ebay/mcp/dist/index.js"],
+      "command": "uv",
+      "args": ["run", "/absolute/path/to/ebay/mcp/server.py"],
       "env": {
         "KLEINANZEIGEN_API_URL": "http://192.168.2.100:80"
       }
@@ -46,22 +40,16 @@ Replace `/absolute/path/to/ebay` with the actual path on your machine.
 
 > The `KLEINANZEIGEN_API_URL` env var is optional — it defaults to `http://192.168.2.100:80`.
 
-### Using npx (no clone needed)
+### Run manually (for testing)
 
-If the package is published to npm, you can use it directly:
+```sh
+uv run mcp/server.py
+```
 
-```json
-{
-  "mcpServers": {
-    "kleinanzeigen": {
-      "command": "npx",
-      "args": ["-y", "kleinanzeigen-mcp"],
-      "env": {
-        "KLEINANZEIGEN_API_URL": "http://192.168.2.100:80"
-      }
-    }
-  }
-}
+Or use the MCP dev inspector:
+
+```sh
+uv run mcp dev mcp/server.py
 ```
 
 ## Tool Reference
