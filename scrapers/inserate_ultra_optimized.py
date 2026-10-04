@@ -9,8 +9,9 @@ import asyncio
 import time
 import random
 import gc
+from datetime import datetime, date, timedelta
 from urllib.parse import urlencode
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import HTTPException
 
@@ -30,6 +31,72 @@ from utils.asyncio_optimizations import (
     EventLoopOptimizer,
     monitor_slow_coroutines,
 )
+
+
+def _page_has_old_listings(results: list, min_publish_date: datetime) -> bool:
+    """Return True if any listing on this page was published before min_publish_date."""
+    for r in results:
+        pub = r.get("published_at")
+        if pub and datetime.fromisoformat(pub) < min_publish_date:
+            return True
+    return False
+
+
+def _filter_by_min_publish_date(results: list, min_publish_date: datetime) -> list:
+    """Remove listings published before min_publish_date. Null published_at entries are kept."""
+    out = []
+    for r in results:
+        pub = r.get("published_at")
+        if pub is None or datetime.fromisoformat(pub) >= min_publish_date:
+            out.append(r)
+    return out
+
+
+def _parse_kleinanzeigen_date(text: str) -> Optional[str]:
+    """Convert a Kleinanzeigen listing date string to an ISO 8601 datetime string.
+
+    Handles three formats:
+      'Heute, 22:06'   → today's date at that time
+      'Gestern, 19:30' → yesterday's date at that time
+      '26.04.2026'     → that date at midnight (no time shown for older listings)
+    Returns None if the text is empty or unparseable.
+    """
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        today = date.today()
+        if text.startswith("Heute,"):
+            h, m = map(int, text.split(",", 1)[1].strip().split(":"))
+            return datetime(today.year, today.month, today.day, h, m).isoformat()
+        if text.startswith("Gestern,"):
+            yesterday = today - timedelta(days=1)
+            h, m = map(int, text.split(",", 1)[1].strip().split(":"))
+            return datetime(
+                yesterday.year, yesterday.month, yesterday.day, h, m
+            ).isoformat()
+        # DD.MM.YYYY
+        d, mo, y = text.split(".")
+        return datetime(int(y), int(mo), int(d)).isoformat()
+    except Exception:
+        return None
+
+
+def _clean_location_text(text: str) -> str:
+    """Clean location text from Kleinanzeigen result cards."""
+    if not text:
+        return ""
+
+    value = str(text).replace("\xa0", " ")
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    value = " ".join(lines)
+    value = " ".join(value.split())
+
+    for bad in ["Ort", "Standort"]:
+        if value.lower().startswith(bad.lower()):
+            value = value[len(bad) :].strip(" :-|•")
+
+    return value.strip()
 
 
 class UltraOptimizedScraper:
@@ -67,9 +134,9 @@ class UltraOptimizedScraper:
         """
         try:
             # Use more specific selector to reduce DOM traversal
-            items = await page.query_selector_all(
-                ".ad-listitem:not(.is-topad):not(.badge-hint-pro-small-srp) article[data-adid]"
-            )
+            # NOTE: Astro relaunch dropped the .ad-listitem wrapper — match
+            # listing articles directly (still skips top-ads via class check).
+            items = await page.query_selector_all("article[data-adid]")
 
             results = []
 
@@ -104,29 +171,119 @@ class UltraOptimizedScraper:
     async def _extract_single_ad(self, article) -> Dict[str, Any]:
         """Extract data from a single ad article element."""
         try:
-            # Get basic attributes first (fastest operations)
             data_adid = await article.get_attribute("data-adid")
             data_href = await article.get_attribute("data-href")
 
             if not data_adid or not data_href:
                 return None
 
-            # Parallel extraction of text content
             title_task = self._get_text_content(
                 article, "h2.text-module-begin a.ellipsis"
             )
+            # Astro layout: no BEM classes anymore — price is the bold <p>
+            # after the <h3> title (strike-through old price is not bold),
+            # description is the <p> directly after the <h3>.
             price_task = self._get_text_content(
-                article, "p.aditem-main--middle--price-shipping--price"
+                article,
+                "p.aditem-main--middle--price-shipping--price, [class*='price'], "
+                "h3 ~ div > p.font-strong",
             )
             desc_task = self._get_text_content(
-                article, "p.aditem-main--middle--description"
+                article, "p.aditem-main--middle--description, h3 + p"
+            )
+            # Astro layout: date is a plain <span> ("Heute, 20:06",
+            # "Gestern, 19:30" or "25.09.2026") next to a calendar icon.
+            date_task = article.evaluate(
+                """
+                (el) => {
+                    const legacy = el.querySelector(".aditem-main--top--right");
+                    if (legacy && legacy.innerText && legacy.innerText.trim()) {
+                        return legacy.innerText.trim();
+                    }
+
+                    const dateRe = /^((Heute|Gestern),\\s*\\d{1,2}:\\d{2}|\\d{2}\\.\\d{2}\\.\\d{4})$/;
+                    for (const span of el.querySelectorAll("span")) {
+                        const text = (span.textContent || "").trim();
+                        if (dateRe.test(text)) {
+                            return text;
+                        }
+                    }
+
+                    return "";
+                }
+                """
             )
 
-            title_text, price_text, description_text = await asyncio.gather(
-                title_task, price_task, desc_task, return_exceptions=True
+            location_task = article.evaluate(
+                """
+                (el) => {
+                    const selectors = [
+                        ".aditem-main--top--left",
+                        ".aditem-main--top--left--location",
+                        "[class*='aditem-main--top--left']",
+                        "[class*='location']",
+                        "[class*='Location']"
+                    ];
+
+                    for (const selector of selectors) {
+                        const node = el.querySelector(selector);
+                        if (node && node.innerText && node.innerText.trim()) {
+                            return node.innerText.trim();
+                        }
+                    }
+
+                    const text = el.innerText || "";
+                    const lines = text
+                        .split("\\n")
+                        .map(line => line.trim())
+                        .filter(Boolean);
+
+                    const zipLine = lines.find(line => /\\b\\d{5}\\b/.test(line));
+                    if (zipLine) {
+                        return zipLine;
+                    }
+
+                    return "";
+                }
+                """
             )
 
-            # Process price text efficiently
+            (
+                title_text,
+                price_text,
+                description_text,
+                date_raw,
+                location_raw,
+            ) = await asyncio.gather(
+                title_task,
+                price_task,
+                desc_task,
+                date_task,
+                location_task,
+                return_exceptions=True,
+            )
+
+            # Astro layout: h2 is gone — fall back to the article's embedded
+            # JSON-LD (<script type="application/ld+json">, fields
+            # title/description/creditText) when the classic selector misses.
+            if not (isinstance(title_text, str) and title_text.strip()):
+                try:
+                    ld_raw = await article.evaluate(
+                        """(el) => {
+                            const s = el.querySelector(
+                                'script[type="application/ld+json"]'
+                            );
+                            if (!s) return null;
+                            try { const j = JSON.parse(s.textContent);
+                                  return j.title || j.name || null; }
+                            catch (e) { return null; }
+                        }"""
+                    )
+                    if isinstance(ld_raw, str) and ld_raw.strip():
+                        title_text = ld_raw.strip()
+                except Exception:
+                    pass
+
             if isinstance(price_text, str):
                 price_text = (
                     price_text.replace("€", "")
@@ -137,14 +294,24 @@ class UltraOptimizedScraper:
             else:
                 price_text = ""
 
+            published_at = _parse_kleinanzeigen_date(
+                date_raw if isinstance(date_raw, str) else ""
+            )
+
+            location_text = _clean_location_text(
+                location_raw if isinstance(location_raw, str) else ""
+            )
+
             return {
                 "adid": data_adid,
                 "url": f"https://www.kleinanzeigen.de{data_href}",
                 "title": title_text if isinstance(title_text, str) else "",
                 "price": price_text,
+                "location": location_text,
                 "description": description_text
                 if isinstance(description_text, str)
                 else "",
+                "published_at": published_at,
             }
 
         except Exception:
@@ -160,10 +327,19 @@ class UltraOptimizedScraper:
         except Exception:
             return ""
 
-    @monitor_slow_coroutines(threshold=2.0)
+    @monitor_slow_coroutines(
+        threshold=2.0,
+        context_fn=lambda self, url, page_num, *a, **kw: (
+            f"OVERVIEW page {page_num}: {url}"
+        ),
+    )
     async def ultra_optimized_fetch_page(
-        self, url: str, page_num: int, retry_count: int = 2
-    ) -> Tuple[List[Dict], PageMetrics]:
+        self,
+        url: str,
+        page_num: int,
+        retry_count: int = 2,
+        extra_selectors: Dict[str, str] = None,
+    ) -> Tuple[List[Dict], PageMetrics, Dict[str, str]]:
         """
         Ultra-optimized page fetching with all performance enhancements.
 
@@ -174,6 +350,7 @@ class UltraOptimizedScraper:
         - Comprehensive error handling
         """
         logger = ErrorLogger(f"ultra_scraper_page_{page_num}")
+        logger.logger.info(f"[OVERVIEW] Fetching page {page_num}: {url}")
 
         with error_handling_context(
             operation="ultra_fetch_page", page_number=page_num, url=url, logger=logger
@@ -205,6 +382,17 @@ class UltraOptimizedScraper:
                     # Extract ads with optimized method
                     results = await self.extract_ads_optimized(page)
 
+                    # Extract any caller-requested selectors from the same page
+                    extras: Dict[str, str] = {}
+                    if extra_selectors:
+                        for key, selector in extra_selectors.items():
+                            try:
+                                el = await page.query_selector(selector)
+                                if el:
+                                    extras[key] = await el.inner_text()
+                            except Exception:
+                                pass
+
                     # Create successful metrics
                     metrics = PageMetrics(
                         page_number=page_num,
@@ -216,7 +404,7 @@ class UltraOptimizedScraper:
                         results_count=len(results),
                     )
 
-                    return results, metrics
+                    return results, metrics, extras
 
                 except Exception as e:
                     last_error = e
@@ -265,7 +453,7 @@ class UltraOptimizedScraper:
                 results_count=0,
             )
 
-            return [], metrics
+            return [], metrics, {}
 
     async def ultra_optimized_scrape(
         self,
@@ -275,6 +463,7 @@ class UltraOptimizedScraper:
         min_price: int = None,
         max_price: int = None,
         page_count: int = 1,
+        min_publish_date: datetime = None,
     ) -> Dict[str, Any]:
         """
         Ultra-optimized multi-page scraping with all performance enhancements.
@@ -289,7 +478,9 @@ class UltraOptimizedScraper:
         tracker = PerformanceTracker()
         tracker.start_request()
 
-        with error_handling_context(operation="ultra_multi_page_scrape", logger=logger) as ctx:
+        with error_handling_context(
+            operation="ultra_multi_page_scrape", logger=logger
+        ) as ctx:
             # Build URLs efficiently
             base_url = "https://www.kleinanzeigen.de"
 
@@ -298,7 +489,7 @@ class UltraOptimizedScraper:
             if min_price is not None or max_price is not None:
                 min_str = str(min_price) if min_price is not None else ""
                 max_str = str(max_price) if max_price is not None else ""
-                price_path = f"/preis:{min_str}:{max_str}"
+                price_path = f"/s-preis:{min_str}:{max_str}"
 
             search_path = f"{price_path}/s-seite:{{page}}"
 
@@ -311,7 +502,11 @@ class UltraOptimizedScraper:
                 params["radius"] = radius
 
             param_string = f"?{urlencode(params)}" if params else ""
-            search_url = base_url + search_path.format(price_path=price_path, page='{page}') + param_string
+            search_url = (
+                base_url
+                + search_path.format(price_path=price_path, page="{page}")
+                + param_string
+            )
 
             # Create page fetch tasks
             async def create_page_task(page_num: int):
@@ -325,8 +520,12 @@ class UltraOptimizedScraper:
             batch_size = min(8, page_count)  # Optimal batch size based on testing
             all_results = []
             all_metrics = []
+            stop_early = False
 
             for i in range(0, len(page_numbers), batch_size):
+                if stop_early:
+                    break
+
                 batch_pages = page_numbers[i : i + batch_size]
 
                 # Create tasks for this batch
@@ -340,7 +539,6 @@ class UltraOptimizedScraper:
                 # Process batch results
                 for result in batch_results:
                     if isinstance(result, Exception):
-                        # Handle unexpected exceptions
                         logger.log_error(
                             ErrorClassifier.classify_exception(
                                 result,
@@ -350,7 +548,16 @@ class UltraOptimizedScraper:
                         )
                         continue
 
-                    page_results, page_metrics = result
+                    page_results, page_metrics, _ = result
+
+                    if min_publish_date and _page_has_old_listings(
+                        page_results, min_publish_date
+                    ):
+                        page_results = _filter_by_min_publish_date(
+                            page_results, min_publish_date
+                        )
+                        stop_early = True
+
                     all_results.extend(page_results)
                     all_metrics.append(page_metrics)
                     tracker.add_page_metric(page_metrics)
@@ -369,10 +576,11 @@ class UltraOptimizedScraper:
             request_metrics = tracker.get_request_metrics()
             task_metrics = self.task_manager.get_metrics()
 
-            # Calculate success statistics
+            # Calculate success statistics against actual pages attempted
+            pages_attempted = len(all_metrics)
             successful_pages = sum(1 for m in all_metrics if m.success)
             success_rate = (
-                (successful_pages / page_count) * 100 if page_count > 0 else 0
+                (successful_pages / pages_attempted) * 100 if pages_attempted > 0 else 0
             )
 
             # Add performance-based warnings
@@ -460,6 +668,7 @@ async def ultra_optimized_scrape_inserate(
     min_price: int = None,
     max_price: int = None,
     page_count: int = 1,
+    min_publish_date: datetime = None,
 ) -> Dict[str, Any]:
     """
     Direct function for ultra-optimized scraping.
@@ -481,6 +690,7 @@ async def ultra_optimized_scrape_inserate(
             min_price=min_price,
             max_price=max_price,
             page_count=page_count,
+            min_publish_date=min_publish_date,
         )
     finally:
         await scraper.cleanup()
