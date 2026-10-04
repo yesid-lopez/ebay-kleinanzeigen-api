@@ -1,9 +1,13 @@
+import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from routers import (
     inserate_ultra as inserate,
     inserat,
     inserate_detailed_ultra as inserate_detailed,
+    inserate_batch,
+    convert_url,
+    inserate_by_url,
 )
 from utils.browser import OptimizedPlaywrightManager
 from utils.asyncio_optimizations import EventLoopOptimizer
@@ -25,7 +29,17 @@ async def lifespan(app: FastAPI):
 
     # Startup: Initialize shared browser manager with optimized settings
     browser_manager = OptimizedPlaywrightManager(max_contexts=20, max_concurrent=10)
-    await browser_manager.start()
+    try:
+        await browser_manager.start()
+    except NotImplementedError as exc:
+        # Windows + `uvicorn --reload`/`--workers` runs a SelectorEventLoop,
+        # which cannot spawn the Playwright driver subprocess (issue #15).
+        if sys.platform == "win32":
+            raise RuntimeError(
+                "Playwright cannot start on this event loop. On Windows, run "
+                "`uvicorn main:app` without --reload/--workers, or use Docker."
+            ) from exc
+        raise
 
     # Store browser manager in app state for access by routers
     app.state.browser_manager = browser_manager
@@ -53,3 +67,6 @@ async def root():
 app.include_router(inserate.router)
 app.include_router(inserat.router)
 app.include_router(inserate_detailed.router)
+app.include_router(inserate_batch.router)
+app.include_router(convert_url.router)
+app.include_router(inserate_by_url.router)
