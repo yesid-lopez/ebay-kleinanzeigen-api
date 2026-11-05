@@ -49,6 +49,12 @@ async def get_inserate_ultra_optimized(
             min_publish_date=min_publish_date,
         )
 
+        if not result.get("success", True):
+            raise HTTPException(
+                status_code=502,
+                detail="Scraping failed for every requested page; see server logs",
+            )
+
         # Clean up response - remove excessive metrics for production
         if "task_metrics" in result:
             del result["task_metrics"]

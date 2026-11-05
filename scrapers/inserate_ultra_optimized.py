@@ -506,9 +506,8 @@ class UltraOptimizedScraper:
                     break
 
                 finally:
-                    # Cleanup resources immediately
-                    if page:
-                        await page.close()
+                    # Cleanup resources immediately. release_context closes the
+                    # page too and never raises, so the page slot is always freed.
                     if context:
                         await self.browser_manager.release_context(context)
 
@@ -685,7 +684,9 @@ class UltraOptimizedScraper:
 
             # Prepare ultra-comprehensive response
             response = {
-                "success": True,
+                # False only when every attempted page failed (e.g. dead browser),
+                # so callers can tell "no listings" apart from "scrape broke".
+                "success": successful_pages > 0 or pages_attempted == 0,
                 "results": all_results,
                 "unique_results": len(all_results),
                 "time_taken": round(request_metrics.total_time, 3),
