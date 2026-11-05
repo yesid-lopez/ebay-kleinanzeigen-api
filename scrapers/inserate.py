@@ -133,8 +133,7 @@ async def optimized_fetch_page(
                             return results
 
                         finally:
-                            if page:
-                                await page.close()
+                            # Also closes the page; never raises.
                             await browser_manager.release_context(context)
 
                     # Execute with concurrency control
